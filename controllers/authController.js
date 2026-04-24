@@ -135,8 +135,23 @@ const profile = async (req, res) => {    //Creates protected route function.
   }
 };
 
+const adminOnly = (req,res) =>{
+  // check role
+  if (req.user.role !== "admin") {
+    return res.status(403).json({
+      message: "Access denied! Admin only"
+    })
+  }
+
+  res.status(200).json({
+    message: "Welcome Admin",
+    user: req.user
+  })
+}
+
 module.exports = {
   register,
   login,
-  profile
+  profile,
+  adminOnly
 };
