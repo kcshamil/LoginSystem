@@ -135,6 +135,19 @@ const profile = async (req, res) => {    //Creates protected route function.
   }
 };
 
+const subadminOnly = (req,res) =>{   //Creates a controller function named subAdminOnly.
+  if(req.user.role !== "subadmin" && req.user.role !== "admin"){    //If user is NOT subadmin AND NOT admin → block access
+      return res.status(403).json({
+        message : "Access denied! Subadmin or Admin only "  
+      })
+  }   //If role is not allowed, send 403 Forbidden.(User is logged in, but does not have permission.)
+
+  res.status(200).json({
+    message: "Welcome Subadmin/Admin",
+    user: req.user
+  })
+}    
+
 const adminOnly = (req,res) =>{
   // check role
   if (req.user.role !== "admin") {
@@ -153,5 +166,6 @@ module.exports = {
   register,
   login,
   profile,
-  adminOnly
+  adminOnly,
+  subadminOnly
 };
