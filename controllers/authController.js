@@ -11,11 +11,16 @@ const getTableByRole = (role) => {  //Creates helper function to identify table 
 };   //Returns correct table name.If role is invalid, returns null.
 
 const getClientIp = (req) => {
-  return (
-    req.headers["x-forwarded-for"]?.split(",")[0] || // for proxy / real IP
-    req.socket.remoteAddress ||                      // Node default
-    req.ip                                           // fallback
-  );
+
+  let ip =
+    req.headers["x-forwarded-for"]?.split(",")[0] ||
+    req.socket.remoteAddress ||
+    req.ip;
+
+  if (ip === "::1") ip = "127.0.0.1";
+  if (ip.startsWith("::ffff:")) ip = ip.replace("::ffff:", "");
+
+  return ip;
 };
 
 
@@ -98,19 +103,21 @@ const login = async (req, res) => {
 
     const user = users[0];
 
-    const [attemptRows] = await db.query(
-      "SELECT * FROM login_attempts WHERE email = ? AND ip_address = ?",
-      [email, ip]
+    // Check security status
+    const [statusRows] = await db.query(
+      `SELECT * FROM login_security_status
+       WHERE email = ? AND ip_address = ? AND role = ?`,
+      [email, ip, role]
     );
 
-    const attempt = attemptRows[0];
+    const status = statusRows[0];
 
-    if (attempt && attempt.is_support_locked) {
+    if (status?.is_support_locked) {
       await transporter.sendMail({
         from: process.env.MAIL_USER,
         to: email,
         subject: "Account Locked - Support Required",
-        text: "Your account has been locked due to repeated failed login attempts. Please contact support to regain access."
+        text: "Your account has been locked due to repeated failed login attempts. Please contact support."
       });
 
       return res.status(403).json({
@@ -119,26 +126,15 @@ const login = async (req, res) => {
       });
     }
 
-    if (attempt && attempt.lock_until && now < new Date(attempt.lock_until)) {
-      await transporter.sendMail({
-        from: process.env.MAIL_USER,
-        to: email,
-        subject: "Account Temporarily Blocked",
-        text: "Your account has been temporarily blocked due to multiple failed login attempts. Please try again later."
-      });
-
+    if (status?.lock_until && now < new Date(status.lock_until)) {
       return res.status(403).json({
         message: "Your account has been blocked, try again later"
       });
     }
 
-    if (
-      attempt &&
-      attempt.throttle_until &&
-      now < new Date(attempt.throttle_until)
-    ) {
+    if (status?.throttle_until && now < new Date(status.throttle_until)) {
       const waitSeconds = Math.ceil(
-        (new Date(attempt.throttle_until) - now) / 1000
+        (new Date(status.throttle_until) - now) / 1000
       );
 
       return res.status(429).json({
@@ -150,46 +146,64 @@ const login = async (req, res) => {
     const isMatch = await bcrypt.compare(password, user.password);
 
     if (!isMatch) {
-      let failedAttempts = 1;
-      let firstFailedAt = now;
-      let lockCount = 0;
-      let firstLockAt = null;
-      let throttleUntil = null;
-      let lockUntil = null;
-      let isSupportLocked = false;
+      // Save failed attempt
+      await db.query(
+        `INSERT INTO login_failed_attempts
+         (email, ip_address, role)
+         VALUES (?, ?, ?)`,
+        [email, ip, role]
+      );
 
-      if (attempt) {
-        const firstFailedTime = attempt.first_failed_at
-          ? new Date(attempt.first_failed_at)
-          : now;
+      // Create security row if not exists
+      await db.query(
+        `INSERT IGNORE INTO login_security_status
+         (email, ip_address, role)
+         VALUES (?, ?, ?)`,
+        [email, ip, role]
+      );
 
-        const diffFromFirstFailed = now - firstFailedTime;
+      // Count failed attempts in last 5 minutes
+      const [fiveMinRows] = await db.query(
+        `SELECT COUNT(*) AS count
+         FROM login_failed_attempts
+         WHERE email = ?
+         AND ip_address = ?
+         AND role = ?
+         AND attempted_at >= NOW() - INTERVAL 5 MINUTE`,
+        [email, ip, role]
+      );
 
-        if (diffFromFirstFailed <= 5 * 60 * 1000) {
-          failedAttempts = attempt.failed_attempts + 1;
-          firstFailedAt = firstFailedTime;
-        } else {
-          failedAttempts = 1;
-          firstFailedAt = now;
-        }
+      // Count failed attempts in last 15 minutes
+      const [fifteenMinRows] = await db.query(
+        `SELECT COUNT(*) AS count
+         FROM login_failed_attempts
+         WHERE email = ?
+         AND ip_address = ?
+         AND role = ?
+         AND attempted_at >= NOW() - INTERVAL 15 MINUTE`,
+        [email, ip, role]
+      );
 
-        lockCount = attempt.lock_count || 0;
-        firstLockAt = attempt.first_lock_at;
-      }
+      const fiveMinCount = fiveMinRows[0].count;
+      const fifteenMinCount = fifteenMinRows[0].count;
 
-      if (failedAttempts >= 5) {
-        const breachCount = failedAttempts - 4;
-        const delayMs = 30 * 1000 * Math.pow(2, breachCount - 1);
-        throttleUntil = new Date(Date.now() + delayMs);
-      }
+      // Temporary lockout: 10 failed attempts within 15 minutes
+      if (fifteenMinCount >= 10) {
+        const [updatedStatusRows] = await db.query(
+          `SELECT * FROM login_security_status
+           WHERE email = ? AND ip_address = ? AND role = ?`,
+          [email, ip, role]
+        );
 
-      if (failedAttempts >= 10) {
-        lockUntil = new Date(Date.now() + 15 * 60 * 1000);
+        const updatedStatus = updatedStatusRows[0];
+
+        let lockCount = updatedStatus.lock_count || 0;
+        let firstLockAt = updatedStatus.first_lock_at;
 
         if (firstLockAt) {
-          const diffFromFirstLock = now - new Date(firstLockAt);
+          const diff = now - new Date(firstLockAt);
 
-          if (diffFromFirstLock <= 24 * 60 * 60 * 1000) {
+          if (diff <= 24 * 60 * 60 * 1000) {
             lockCount += 1;
           } else {
             lockCount = 1;
@@ -200,87 +214,68 @@ const login = async (req, res) => {
           firstLockAt = now;
         }
 
-        failedAttempts = 0;
-        firstFailedAt = null;
-        throttleUntil = null;
+        const isSupportLocked = lockCount >= 3;
+        const lockUntil = isSupportLocked
+          ? null
+          : new Date(Date.now() + 15 * 60 * 1000);
 
-        if (lockCount >= 3) {
-          isSupportLocked = true;
-        }
-      }
-
-      if (attempt) {
         await db.query(
-          `UPDATE login_attempts 
-           SET failed_attempts = ?, 
-               first_failed_at = ?, 
-               last_attempt = NOW(), 
-               throttle_until = ?, 
-               lock_until = ?, 
-               lock_count = ?, 
-               first_lock_at = ?, 
+          `UPDATE login_security_status
+           SET lock_until = ?,
+               throttle_until = NULL,
+               lock_count = ?,
+               first_lock_at = ?,
                is_support_locked = ?
-           WHERE email = ? AND ip_address = ?`,
+           WHERE email = ? AND ip_address = ? AND role = ?`,
           [
-            failedAttempts,
-            firstFailedAt,
-            throttleUntil,
             lockUntil,
             lockCount,
             firstLockAt,
             isSupportLocked,
             email,
-            ip
-          ]
-        );
-      } else {
-        await db.query(
-          `INSERT INTO login_attempts 
-           (email, ip_address, failed_attempts, first_failed_at, last_attempt, throttle_until, lock_until, lock_count, first_lock_at, is_support_locked)
-           VALUES (?, ?, ?, ?, NOW(), ?, ?, ?, ?, ?)`,
-          [
-            email,
             ip,
-            failedAttempts,
-            firstFailedAt,
-            throttleUntil,
-            lockUntil,
-            lockCount,
-            firstLockAt,
-            isSupportLocked
+            role
           ]
         );
-      }
 
-      if (isSupportLocked) {
         await transporter.sendMail({
           from: process.env.MAIL_USER,
           to: email,
-          subject: "Account Locked - Support Required",
-          text: "Your account has been locked due to repeated temporary lockouts. Please contact support to regain access."
+          subject: isSupportLocked
+            ? "Account Locked - Support Required"
+            : "Account Temporarily Blocked",
+          text: isSupportLocked
+            ? "Your account has been locked due to repeated temporary lockouts. Please contact support."
+            : "Your account has been blocked for 15 minutes due to multiple failed login attempts."
         });
 
-        return res.status(403).json({
-          message: "Your account has been locked, please contact support",
-          contactSupport: "/contact-us"
-        });
-      }
-
-      if (lockUntil) {
-        await transporter.sendMail({
-          from: process.env.MAIL_USER,
-          to: email,
-          subject: "Account Temporarily Blocked",
-          text: "Your account has been blocked for 15 minutes due to multiple failed login attempts."
-        });
+        if (isSupportLocked) {
+          return res.status(403).json({
+            message: "Your account has been locked, please contact support",
+            contactSupport: "/contact-us"
+          });
+        }
 
         return res.status(403).json({
           message: "Your account has been blocked, try again later"
         });
       }
 
-      if (throttleUntil) {
-        const waitSeconds = Math.ceil((throttleUntil - now) / 1000);
+      // Throttling: 5 failed attempts within 5 minutes
+      if (fiveMinCount >= 5) {
+        const breachCount = fiveMinCount - 4;
+
+        // 5th fail = 30 sec, 6th = 60 sec, 7th = 120 sec
+        const delayMs = 30 * 1000 * Math.pow(2, breachCount - 1);
+        const throttleUntil = new Date(Date.now() + delayMs);
+        const waitSeconds = Math.ceil(delayMs / 1000);
+
+        await db.query(
+          `UPDATE login_security_status
+           SET throttle_until = ?
+           WHERE email = ? AND ip_address = ? AND role = ?`,
+          [throttleUntil, email, ip, role]
+        );
 
         await transporter.sendMail({
           from: process.env.MAIL_USER,
@@ -307,16 +302,27 @@ const login = async (req, res) => {
       });
     }
 
+    // Login success: clear failed attempts for this email + IP + role
     await db.query(
-      "DELETE FROM login_attempts WHERE email = ? AND ip_address = ?",
-      [email, ip]
+      `DELETE FROM login_failed_attempts
+       WHERE email = ? AND ip_address = ? AND role = ?`,
+      [email, ip, role]
+    );
+
+    await db.query(
+      `UPDATE login_security_status
+       SET throttle_until = NULL,
+           lock_until = NULL
+       WHERE email = ? AND ip_address = ? AND role = ?
+       AND is_support_locked = FALSE`,
+      [email, ip, role]
     );
 
     const token = jwt.sign(
       {
         id: user.id,
         email: user.email,
-        role: role
+        role
       },
       process.env.JWT_SECRET,
       { expiresIn: "1h" }
