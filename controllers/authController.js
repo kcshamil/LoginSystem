@@ -290,12 +290,12 @@ const login = async (req, res) => {
         });
       }
 
-      await transporter.sendMail({
+      transporter.sendMail({
         from: process.env.MAIL_USER,
         to: email,
         subject: "Security Alert",
         text: "A failed login attempt was detected on your account."
-      });
+      }).catch(err => console.log(err));
 
       return res.status(401).json({
         message: "Invalid password"
