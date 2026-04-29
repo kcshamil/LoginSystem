@@ -10,6 +10,30 @@ const getTableByRole = (role) => {  //Creates helper function to identify table 
   return null;
 };   //Returns correct table name.If role is invalid, returns null.
 
+const findUserByEmail = async (email) => {
+  const tables = [
+    { table: "public_users", role: "public" },
+    { table: "sub_admins", role: "subadmin" },
+    { table: "admins", role: "admin" }
+  ];
+
+  for (const item of tables) {
+    const [users] = await db.query(
+      `SELECT * FROM ${item.table} WHERE email = ?`,
+      [email]
+    );
+
+    if (users.length > 0) {
+      return {
+        user: users[0],
+        role: item.role
+      };
+    }
+  }
+
+  return null;
+};
+
 const getClientIp = (req) => {
 
   let ip =
@@ -78,7 +102,7 @@ const register = async (req, res) => {  //Creates async register function.
 const login = async (req, res) => {
   try {
     // Get email, password, and role from frontend request body
-    const { email, password, role } = req.body;
+    const { email, password } = req.body;
 
     // Get user's IP address
     const ip = getClientIp(req);
@@ -86,36 +110,21 @@ const login = async (req, res) => {
     // Store current date and time
     const now = new Date();
 
-    // Check if email, password, or role is missing
-    if (!email || !password || !role) {
+    // Check if email, password is missing
+    if (!email || !password) {
       return res.status(400).json({
-        message: "Email, password and role are required"
+        message: "Email and password are required"
       });
     }
 
-    // Get table name based on role
-    // Example: admin -> admins, public -> public_users
-    const table = getTableByRole(role);
+    const found = await findUserByEmail(email);
 
-    // If role is invalid, stop login
-    if (!table) {
-      return res.status(400).json({ message: "Invalid role" });
-    }
-
-    // Find user from selected table using email
-    const [users] = await db.query(
-      `SELECT * FROM ${table} WHERE email = ?`,
-      [email]
-    );
-
-    // If user not found
-    if (users.length === 0) {
+    if (!found) {
       return res.status(404).json({ message: "User not found" });
     }
 
-    // Store first user data
-    const user = users[0];
-
+    const user = found.user;
+    const role = found.role;
     // Get login security status for this email + IP + role
     const [statusRows] = await db.query(
       `SELECT * FROM login_security_status
