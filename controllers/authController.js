@@ -101,7 +101,7 @@ const register = async (req, res) => {  //Creates async register function.
 // Login controller function
 const login = async (req, res) => {
   try {
-    // Get email, password, and role from frontend request body
+    // Get email, password from frontend request body
     const { email, password } = req.body;
 
     // Get user's IP address
